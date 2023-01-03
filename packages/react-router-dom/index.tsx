@@ -14,6 +14,7 @@ import {
   createPath,
   useHref,
   useLocation,
+  useMatch,
   useMatches,
   useNavigate,
   useNavigation,
@@ -41,7 +42,7 @@ import {
   createHashHistory,
   invariant,
   joinPaths,
-  ErrorResponse,
+  matchPath,
 } from "@remix-run/router";
 
 import type {
@@ -64,7 +65,6 @@ import {
 export type {
   FormEncType,
   FormMethod,
-  GetScrollRestorationKeyFunction,
   ParamKeyValuePair,
   SubmitOptions,
   URLSearchParamsInit,
@@ -205,7 +205,7 @@ export function createBrowserRouter(
   return createRouter({
     basename: opts?.basename,
     history: createBrowserHistory({ window: opts?.window }),
-    hydrationData: opts?.hydrationData || parseHydrationData(),
+    hydrationData: opts?.hydrationData || window?.__staticRouterHydrationData,
     routes: enhanceManualRouteObjects(routes),
   }).initialize();
 }
@@ -221,51 +221,10 @@ export function createHashRouter(
   return createRouter({
     basename: opts?.basename,
     history: createHashHistory({ window: opts?.window }),
-    hydrationData: opts?.hydrationData || parseHydrationData(),
+    hydrationData: opts?.hydrationData || window?.__staticRouterHydrationData,
     routes: enhanceManualRouteObjects(routes),
   }).initialize();
 }
-
-function parseHydrationData(): HydrationState | undefined {
-  let state = window?.__staticRouterHydrationData;
-  if (state && state.errors) {
-    state = {
-      ...state,
-      errors: deserializeErrors(state.errors),
-    };
-  }
-  return state;
-}
-
-function deserializeErrors(
-  errors: RemixRouter["state"]["errors"]
-): RemixRouter["state"]["errors"] {
-  if (!errors) return null;
-  let entries = Object.entries(errors);
-  let serialized: RemixRouter["state"]["errors"] = {};
-  for (let [key, val] of entries) {
-    // Hey you!  If you change this, please change the corresponding logic in
-    // serializeErrors in react-router-dom/server.tsx :)
-    if (val && val.__type === "RouteErrorResponse") {
-      serialized[key] = new ErrorResponse(
-        val.status,
-        val.statusText,
-        val.data,
-        val.internal === true
-      );
-    } else if (val && val.__type === "Error") {
-      let error = new Error(val.message);
-      // Wipe away the client-side stack trace.  Nothing to fill it in with
-      // because we don't serialize SSR stack traces for security reasons
-      error.stack = "";
-      serialized[key] = error;
-    } else {
-      serialized[key] = val;
-    }
-  }
-  return serialized;
-}
-
 //#endregion
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -485,11 +444,8 @@ export const NavLink = React.forwardRef<HTMLAnchorElement, NavLinkProps>(
     let path = useResolvedPath(to, { relative: rest.relative });
     let location = useLocation();
     let routerState = React.useContext(DataRouterStateContext);
-    let { navigator } = React.useContext(NavigationContext);
 
-    let toPathname = navigator.encodeLocation
-      ? navigator.encodeLocation(path).pathname
-      : path.pathname;
+    let toPathname = path.pathname;
     let locationPathname = location.pathname;
     let nextLocationPathname =
       routerState && routerState.navigation && routerState.navigation.location
@@ -657,15 +613,7 @@ const FormImpl = React.forwardRef<HTMLFormElement, FormImplProps>(
       let submitter = (event as unknown as HTMLSubmitEvent).nativeEvent
         .submitter as HTMLFormSubmitter | null;
 
-      let submitMethod =
-        (submitter?.getAttribute("formmethod") as FormMethod | undefined) ||
-        method;
-
-      submit(submitter || event.currentTarget, {
-        method: submitMethod,
-        replace,
-        relative,
-      });
+      submit(submitter || event.currentTarget, { method, replace, relative });
     };
 
     return (
@@ -681,10 +629,10 @@ const FormImpl = React.forwardRef<HTMLFormElement, FormImplProps>(
 );
 
 if (__DEV__) {
-  FormImpl.displayName = "FormImpl";
+  Form.displayName = "Form";
 }
 
-export interface ScrollRestorationProps {
+interface ScrollRestorationProps {
   getKey?: GetScrollRestorationKeyFunction;
   storageKey?: string;
 }
@@ -724,7 +672,7 @@ enum DataRouterStateHook {
 function getDataRouterConsoleError(
   hookName: DataRouterHook | DataRouterStateHook
 ) {
-  return `${hookName} must be used within a data router.  See https://reactrouter.com/routers/picking-a-router.`;
+  return `${hookName} must be used within a data router.  See https://reactrouter.com/en/main/routers/picking-a-router.`;
 }
 
 function useDataRouterContext(hookName: DataRouterHook) {
@@ -931,9 +879,10 @@ export function useFormAction(
   invariant(routeContext, "useFormAction must be used inside a RouteContext");
 
   let [match] = routeContext.matches.slice(-1);
+  let resolvedAction = action ?? ".";
   // Shallow clone path so we can modify it below, otherwise we modify the
   // object referenced by useMemo inside useResolvedPath
-  let path = { ...useResolvedPath(action ? action : ".", { relative }) };
+  let path = { ...useResolvedPath(resolvedAction, { relative }) };
 
   // Previously we set the default action to ".". The problem with this is that
   // `useResolvedPath(".")` excludes search params and the hash of the resolved
@@ -1076,15 +1025,14 @@ const SCROLL_RESTORATION_STORAGE_KEY = "react-router-scroll-positions";
 let savedScrollPositions: Record<string, number> = {};
 
 /**
- * When rendered inside a RouterProvider, will restore scroll positions on navigations
+ * When rendered inside a RouterProvider, will restore scroll positions on navigations.
+ * If element `id` is not specified, will use `window` instead.
  */
-function useScrollRestoration({
+function useElementScrollRestoration({
+  id,
   getKey,
   storageKey,
-}: {
-  getKey?: GetScrollRestorationKeyFunction;
-  storageKey?: string;
-} = {}) {
+}: { id?: string } & ScrollRestorationProps = {}) {
   let { router } = useDataRouterContext(DataRouterHook.UseScrollRestoration);
   let { restoreScrollPosition, preventScrollReset } = useDataRouterState(
     DataRouterStateHook.UseScrollRestoration
@@ -1092,6 +1040,14 @@ function useScrollRestoration({
   let location = useLocation();
   let matches = useMatches();
   let navigation = useNavigation();
+
+  const getScrollElement = () => (id && document.getElementById(id)) || window;
+
+  // window has scrollY but normal elements have scrollTop
+  const getScrollY = () => {
+    const el = getScrollElement();
+    return "scrollY" in el ? el.scrollY : el.scrollTop;
+  };
 
   // Trigger manual scroll restoration while we're active
   React.useEffect(() => {
@@ -1105,8 +1061,9 @@ function useScrollRestoration({
   useBeforeUnload(
     React.useCallback(() => {
       if (navigation.state === "idle") {
+        // TODO: key should probably incorporate the ID somehow
         let key = (getKey ? getKey(location, matches) : null) || location.key;
-        savedScrollPositions[key] = window.scrollY;
+        savedScrollPositions[key] = getScrollY();
       }
       sessionStorage.setItem(
         storageKey || SCROLL_RESTORATION_STORAGE_KEY,
@@ -1117,77 +1074,70 @@ function useScrollRestoration({
   );
 
   // Read in any saved scroll locations
-  if (typeof document !== "undefined") {
-    // eslint-disable-next-line react-hooks/rules-of-hooks
-    React.useLayoutEffect(() => {
-      try {
-        let sessionPositions = sessionStorage.getItem(
-          storageKey || SCROLL_RESTORATION_STORAGE_KEY
-        );
-        if (sessionPositions) {
-          savedScrollPositions = JSON.parse(sessionPositions);
-        }
-      } catch (e) {
-        // no-op, use default empty object
-      }
-    }, [storageKey]);
-
-    // Enable scroll restoration in the router
-    // eslint-disable-next-line react-hooks/rules-of-hooks
-    React.useLayoutEffect(() => {
-      let disableScrollRestoration = router?.enableScrollRestoration(
-        savedScrollPositions,
-        () => window.scrollY,
-        getKey
+  React.useLayoutEffect(() => {
+    try {
+      let sessionPositions = sessionStorage.getItem(
+        storageKey || SCROLL_RESTORATION_STORAGE_KEY
       );
-      return () => disableScrollRestoration && disableScrollRestoration();
-    }, [router, getKey]);
+      if (sessionPositions) {
+        savedScrollPositions = JSON.parse(sessionPositions);
+      }
+    } catch (e) {
+      // no-op, use default empty object
+    }
+  }, [storageKey]);
 
-    // Restore scrolling when state.restoreScrollPosition changes
-    // eslint-disable-next-line react-hooks/rules-of-hooks
-    React.useLayoutEffect(() => {
-      // Explicit false means don't do anything (used for submissions)
-      if (restoreScrollPosition === false) {
+  // Enable scroll restoration in the router
+  React.useLayoutEffect(() => {
+    let disableScrollRestoration = router?.enableScrollRestoration(
+      savedScrollPositions,
+      getScrollY,
+      getKey
+    );
+    return () => disableScrollRestoration && disableScrollRestoration();
+  }, [router, getKey]);
+
+  // Restore scrolling when state.restoreScrollPosition changes
+  React.useLayoutEffect(() => {
+    // Explicit false means don't do anything (used for submissions)
+    if (restoreScrollPosition === false) {
+      return;
+    }
+
+    // been here before, scroll to it
+    if (typeof restoreScrollPosition === "number") {
+      getScrollElement().scrollTo(0, restoreScrollPosition);
+      return;
+    }
+
+    // try to scroll to the hash
+    if (location.hash) {
+      let el = document.getElementById(location.hash.slice(1));
+      if (el) {
+        el.scrollIntoView();
         return;
       }
+    }
 
-      // been here before, scroll to it
-      if (typeof restoreScrollPosition === "number") {
-        window.scrollTo(0, restoreScrollPosition);
-        return;
-      }
+    // Opt out of scroll reset if this link requested it
+    if (preventScrollReset === true) {
+      return;
+    }
 
-      // try to scroll to the hash
-      if (location.hash) {
-        let el = document.getElementById(location.hash.slice(1));
-        if (el) {
-          el.scrollIntoView();
-          return;
-        }
-      }
-
-      // Opt out of scroll reset if this link requested it
-      if (preventScrollReset === true) {
-        return;
-      }
-
-      // otherwise go to the top on new locations
-      window.scrollTo(0, 0);
-    }, [location, restoreScrollPosition, preventScrollReset]);
-  }
+    // otherwise go to the top on new locations
+    getScrollElement().scrollTo(0, 0);
+  }, [location, restoreScrollPosition, preventScrollReset]);
 }
 
 /**
- * Setup a callback to be fired on the window's `beforeunload` event. This is
- * useful for saving some data to `window.localStorage` just before the page
- * refreshes.
- *
- * Note: The `callback` argument should be a function created with
- * `React.useCallback()`.
+ * When rendered inside a RouterProvider, will restore scroll positions on navigations
  */
-export function useBeforeUnload(
-  callback: (event: BeforeUnloadEvent) => any
-): void {
+function useScrollRestoration(options: ScrollRestorationProps = {}) {
+  // default no id means it will use window
+  useElementScrollRestoration(options);
+}
+
+function useBeforeUnload(callback: () => any): void {
   React.useEffect(() => {
     window.addEventListener("beforeunload", callback);
     return () => {
@@ -1195,6 +1145,7 @@ export function useBeforeUnload(
     };
   }, [callback]);
 }
+
 //#endregion
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -1218,5 +1169,3 @@ function warning(cond: boolean, message: string): void {
   }
 }
 //#endregion
-
-export { useScrollRestoration as UNSAFE_useScrollRestoration };
